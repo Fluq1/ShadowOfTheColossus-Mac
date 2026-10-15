@@ -2,6 +2,8 @@
 
 **[Português](#português)** · **[English](#english)** · [Releases](../../releases) · [Changelog](CHANGELOG.md)
 
+- Fork pra uso pessoal , Rosetta porque eu não tenho grana pra pagar Claude Opus.
+
 > **Nenhum arquivo do jogo nem da Sony está incluído / No game or Sony files are included.**
 > Você precisa do seu próprio dump do jogo e, para ter som, de dois módulos do seu próprio
 > console. / You need your own game dump and, for sound, two modules from your own console.
