@@ -37,6 +37,10 @@ CommandRecorder* g_recorder{};
 u32 CurrentThreadId() {
 #ifdef _WIN32
     return static_cast<u32>(GetCurrentThreadId());
+#elif defined(__APPLE__)
+    u64 tid{};
+    pthread_threadid_np(nullptr, &tid);
+    return static_cast<u32>(tid);
 #else
     return static_cast<u32>(gettid());
 #endif

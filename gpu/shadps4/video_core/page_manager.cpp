@@ -32,6 +32,10 @@
 #include "video_core/sotc_stats.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
+#ifndef MAX_PATH
+#define MAX_PATH 1024
+#endif
+
 #ifndef _WIN64
 #include <sys/mman.h>
 #else

@@ -51,7 +51,13 @@ if (NOT magic_enum_FOUND)
     target_include_directories(magic_enum INTERFACE third_party/magic_enum/include
                                                     third_party/magic_enum/include/magic_enum)
 endif()
-find_package(tsl-robin-map REQUIRED)
+find_package(tsl-robin-map QUIET)
+# macOS: no Homebrew formula; headers are vendored (TSL_ROBIN_MAP_INCLUDE_DIR from build.sh).
+if (NOT tsl-robin-map_FOUND)
+    add_library(tsl-robin-map INTERFACE)
+    add_library(tsl::robin_map ALIAS tsl-robin-map)
+    target_include_directories(tsl-robin-map INTERFACE ${TSL_ROBIN_MAP_INCLUDE_DIR})
+endif()
 find_package(VulkanMemoryAllocator CONFIG QUIET)
 if (NOT VulkanMemoryAllocator_FOUND)
     # MSYS2 ships the header (include/vma/vk_mem_alloc.h) without a CMake package.
@@ -63,7 +69,7 @@ endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(XXHASH REQUIRED IMPORTED_TARGET libxxhash)
 pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
-if (NOT WIN32)
+if (NOT WIN32 AND NOT APPLE)
     pkg_check_modules(X11 REQUIRED IMPORTED_TARGET x11)
 endif()
 find_package(miniz QUIET)
@@ -129,7 +135,24 @@ set(COMMON
     shadps4/common/string_util.cpp shadps4/common/thread.cpp shadps4/common/signal_context.cpp
     shim/common/logging/log.cpp)
 file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
-pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
+# macOS: FFmpeg has no x86_64 Homebrew bottle; avplayer is dropped unless enabled explicitly.
+if (APPLE)
+    option(BB_MACOS_FFMPEG "Build the avplayer with FFmpeg on macOS (needs an x86_64 FFmpeg)" OFF)
+    if (BB_MACOS_FFMPEG)
+        pkg_check_modules(FFMPEG IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
+    endif()
+else()
+    pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
+endif()
+if (FFMPEG_FOUND)
+    set(AVPLAYER_SOURCES ${AVPLAYER})
+    set(BB_FFMPEG_LIB PkgConfig::FFMPEG)
+    set(BB_VIDEODEC shadps4/core/libraries/videodec/video_utils.cpp)
+else()
+    set(AVPLAYER_SOURCES)
+    set(BB_FFMPEG_LIB)
+    set(BB_VIDEODEC)
+endif()
 file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp sotc/*.cpp)
 # Windows: a DLL cannot leave the runtime_* symbols for bb-probe.exe to resolve, so the
 # library is static there and linked into the executable.
@@ -141,8 +164,8 @@ endif()
 add_library(bbgpu ${BBGPU_KIND} ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES}
     shadps4/core/libraries/gnmdriver/gnmdriver.cpp
     shadps4/core/libraries/videoout/driver.cpp shadps4/core/libraries/videoout/video_out.cpp
-    shadps4/core/libraries/kernel/equeue.cpp ${AVPLAYER}
-    shadps4/core/libraries/videodec/video_utils.cpp)
+    shadps4/core/libraries/kernel/equeue.cpp ${AVPLAYER_SOURCES}
+    ${BB_VIDEODEC})
 add_dependencies(bbgpu host_shaders)
 # In-game settings menu: Dear ImGui (third_party/imgui, MIT) with its Vulkan backend, and an
 # embedded Cyrillic font (third_party/fonts).
@@ -159,11 +182,14 @@ target_include_directories(bbgpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_pa
 target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
 # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe.
-if (NOT WIN32)
+if (APPLE)
+    # Unresolved runtime_* symbols resolve from the main executable at link/run time.
+    target_link_options(bbgpu PRIVATE -Wl,-undefined,dynamic_lookup)
+elseif (NOT WIN32)
     target_link_options(bbgpu PRIVATE -Wl,--allow-shlib-undefined)
 endif()
 target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
-    tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
+    tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 ${BB_FFMPEG_LIB} miniz::miniz Zydis::Zydis sirit)
 if (WIN32)
     # Guest code is entered with the System V ABI; NOMINMAX/WIN32_LEAN_AND_MEAN keep
     # <windows.h> out of the way of std::min/max and the Vulkan/SDL headers.
@@ -171,6 +197,11 @@ if (WIN32)
     target_compile_options(bbgpu PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/shim/bb_win_compat.h)
     target_include_directories(bbgpu PRIVATE third_party/xbyak)
     target_link_libraries(bbgpu PUBLIC Vulkan::Vulkan ws2_32 bcrypt ntdll synchronization winmm)
+elseif (APPLE)
+    # MoltenVK is the Vulkan implementation; the Metal surface extension is used on macOS.
+    target_compile_definitions(bbgpu PUBLIC VK_USE_PLATFORM_METAL_EXT)
+    target_include_directories(bbgpu PRIVATE third_party/xbyak)
+    target_link_libraries(bbgpu PUBLIC Vulkan::Vulkan)
 else()
     target_link_libraries(bbgpu PUBLIC PkgConfig::X11)
 endif()

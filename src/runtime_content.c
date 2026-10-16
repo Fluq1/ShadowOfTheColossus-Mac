@@ -6,6 +6,10 @@
 #include <string.h>
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <dirent.h>
+#include <strings.h>
+#include <sys/stat.h>
 #endif
 #define INVALID_ID ((int32_t)0x805a1000)
 #define NOT_LOADED ((int32_t)0x805a1001)
@@ -84,7 +88,7 @@ typedef struct { char label[17]; char padding[3]; uint32_t status; } AddonInfo; 
 static AddonInfo addons[MAX_ADDONS];
 static unsigned addons_scanned;
 /* The string value of key in a param.sfo image, or NULL. */
-static const char *sfo_string(const unsigned char *data, size_t size, const char *key) {
+static __attribute__((unused)) const char *sfo_string(const unsigned char *data, size_t size, const char *key) {
     if (size<20 || memcmp(data,"\0PSF",4)) return NULL;
     uint32_t keys, values, count;
     memcpy(&keys,data+8,4); memcpy(&values,data+12,4); memcpy(&count,data+16,4);
@@ -101,14 +105,72 @@ static const char *sfo_string(const unsigned char *data, size_t size, const char
     return NULL;
 }
 /* True when the entitlement of content ID is listed already (a package and its installed folder). */
-static int addon_known(const char *content) {
+static __attribute__((unused)) int addon_known(const char *content) {
     for (unsigned i=0;i<addon_count;++i) if (!strncmp(addons[i].label,content+20,16)) return 1;
     return 0;
 }
 static void scan_addons(void) {
     if (addons_scanned) return;
     addons_scanned=1;
-#ifndef _WIN32
+#ifdef __APPLE__
+    /* POSIX port of the Windows DLC scan below (SOTC_DLC_DIR), so add-ons are detected too. */
+    const char *root=getenv("SOTC_DLC_DIR");
+    if (!root || !*root) return;
+    static char base[1024];
+    struct stat st;
+    snprintf(base,sizeof base,"%s/CUSA08809",root);
+    if (stat(base,&st)!=0) snprintf(base,sizeof base,"%s",root);
+    DIR *dir=opendir(base);
+    if (!dir) { printf("Runtime: DLC folder %s not found\n",base); return; }
+    struct dirent *ent;
+    while ((ent=readdir(dir))) {
+        if (ent->d_name[0]=='.') continue;
+        static char path[1400];
+        const size_t name_len=strlen(ent->d_name);
+        snprintf(path,sizeof path,"%s/%s",base,ent->d_name);
+        if (stat(path,&st)!=0) continue;
+        if (!S_ISDIR(st.st_mode) && name_len>4 && !strcasecmp(ent->d_name+name_len-4,".pkg")) {
+            FILE *pkg=fopen(path,"rb");
+            static unsigned char header[0x80];
+            const size_t got=pkg ? fread(header,1,sizeof header,pkg) : 0;
+            if (pkg) fclose(pkg);
+            static char content[37];
+            memcpy(content,header+0x40,36); content[36]=0;
+            const uint32_t type=(uint32_t)header[0x74]<<24|header[0x75]<<16|header[0x76]<<8|header[0x77];
+            if (got<sizeof header || memcmp(header,"\x7f" "CNT",4) || type!=0x1b ||
+                !strstr(content,"CUSA08809") || strlen(content)<=20 || addon_count==MAX_ADDONS ||
+                addon_known(content)) continue;
+            AddonInfo *info=&addons[addon_count++];
+            memset(info,0,sizeof *info);
+            snprintf(info->label,sizeof info->label,"%s",content+20);
+            info->status=4;
+            printf("Runtime: DLC %s: entitlement %s\n",ent->d_name,info->label);
+            continue;
+        }
+        if (!S_ISDIR(st.st_mode)) continue;
+        snprintf(path,sizeof path,"%s/%s/sce_sys/param.sfo",base,ent->d_name);
+        FILE *f=fopen(path,"rb");
+        if (!f) continue;
+        static unsigned char data[65536]; /* not on the guest thread's small stack */
+        const size_t size=fread(data,1,sizeof data,f);
+        fclose(f);
+        const char *category=sfo_string(data,size,"CATEGORY");
+        const char *content=sfo_string(data,size,"CONTENT_ID");
+        if (!category || strncmp(category,"ac",2) || !content || strlen(content)<=20) {
+            printf("Runtime: DLC %s skipped (not add-on content)\n",ent->d_name);
+            continue;
+        }
+        if (addon_count==MAX_ADDONS) break;
+        if (addon_known(content)) continue;
+        AddonInfo *info=&addons[addon_count++];
+        memset(info,0,sizeof *info);
+        snprintf(info->label,sizeof info->label,"%s",content+20);
+        info->status=4; /* installed */
+        printf("Runtime: DLC %s: entitlement %s\n",ent->d_name,info->label);
+    }
+    closedir(dir);
+    return;
+#elif !defined(_WIN32)
     return;
 #else
     const char *root=getenv("SOTC_DLC_DIR");

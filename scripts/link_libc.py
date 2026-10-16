@@ -8,6 +8,7 @@ import hashlib
 import json
 from pathlib import Path
 import struct
+import sys
 from prepare import parse_self, span, unpack
 
 
@@ -161,17 +162,21 @@ def link(game, out):
     # TLS). glibc owns FS on Linux, so rewrite the segment prefix to GS; the
     # runtime points GS at each guest thread's TCB. Only executable eboot
     # segments are scanned, and only this exact 9-byte instruction.
+    # macOS is different: it keeps its own thread pointer in GS, so FS is free
+    # and the runtime points FS at the guest TCB through the LDT
+    # (src/runtime_thread.c); the prefix stays 0x64.
     fs_load = bytes.fromhex('64488b042500000000')
     patched = 0
-    for p in main['ph']:
-        if p['type'] != 1 or not p['flags'] & 1:
-            continue
-        start, end = p['vaddr'], p['vaddr'] + p['filesz']
-        at = image.find(fs_load, start, end)
-        while at >= 0:
-            image[at] = 0x65
-            patched += 1
-            at = image.find(fs_load, at + len(fs_load), end)
+    if sys.platform != 'darwin':
+        for p in main['ph']:
+            if p['type'] != 1 or not p['flags'] & 1:
+                continue
+            start, end = p['vaddr'], p['vaddr'] + p['filesz']
+            at = image.find(fs_load, start, end)
+            while at >= 0:
+                image[at] = 0x65
+                patched += 1
+                at = image.find(fs_load, at + len(fs_load), end)
     main_tls = next((p for p in main['ph'] if p['type']==7), None)
     main_tls_values = (main_tls['vaddr'], main_tls['filesz'], main_tls['memsz'], main_tls['align']) if main_tls else (0,0,0,0)
     if main_tls and (main_tls['filesz'] > main_tls['memsz'] or main_tls['memsz'] > 1024*1024

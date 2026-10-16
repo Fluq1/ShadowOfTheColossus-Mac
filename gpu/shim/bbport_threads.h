@@ -10,6 +10,10 @@
 #ifdef _WIN32
 #include <bit>
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <sys/resource.h>
+#include <sys/sysctl.h>
+#include <unistd.h>
 #else
 #include <sched.h>
 #include <sys/resource.h>
@@ -30,6 +34,22 @@ inline unsigned Available() {
 /// The calling thread only runs when cores are otherwise idle (lowest Windows priority).
 inline void MakeBackground() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+}
+#elif defined(__APPLE__)
+
+/// Hardware threads available to the process (active CPUs reported by the kernel).
+inline unsigned Available() {
+    int cpus = 0;
+    size_t size = sizeof(cpus);
+    if (sysctlbyname("hw.activecpu", &cpus, &size, nullptr, 0) == 0 && cpus > 0) {
+        return static_cast<unsigned>(cpus);
+    }
+    return std::max(1u, std::thread::hardware_concurrency());
+}
+
+/// The calling thread only runs on otherwise idle cores (lowest scheduling priority / nice).
+inline void MakeBackground() {
+    setpriority(PRIO_PROCESS, 0, 19);
 }
 #else
 

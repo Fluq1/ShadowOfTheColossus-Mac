@@ -10,6 +10,10 @@
 #ifdef _WIN32
 #include <windows.h>
 #undef near
+#elif defined(__APPLE__)
+#include <pthread.h>
+#include <sys/ucontext.h>
+#include <unistd.h>
 #else
 #include <ucontext.h>
 #include <unistd.h>
@@ -18,6 +22,18 @@
 
 namespace BbWriteLog {
 namespace {
+inline std::uint32_t CurrentThreadId() {
+#if defined(__APPLE__)
+    std::uint64_t tid{};
+    pthread_threadid_np(nullptr, &tid);
+    return static_cast<std::uint32_t>(tid);
+#elif defined(_WIN32)
+    return static_cast<std::uint32_t>(GetCurrentThreadId());
+#else
+    return static_cast<std::uint32_t>(gettid());
+#endif
+}
+
 struct Entry {
     std::uint64_t address, size, first, tsc;
     std::uint32_t source, tid;
@@ -79,7 +95,7 @@ void Record(std::uint64_t address, const void* data, std::uint64_t size, Source 
         }
         std::fprintf(stderr, "%s\n", line.c_str());
     }
-    static thread_local const std::uint32_t tid = static_cast<std::uint32_t>(gettid());
+    static thread_local const std::uint32_t tid = CurrentThreadId();
     Entry e{address, size, 0, __rdtsc(), source, tid};
     std::memcpy(&e.first, data, size < 8 ? size : 8);
     Push(ring, head, e);
@@ -111,6 +127,11 @@ extern "C" void bbgpu_dump_guest_writes(void* ucontext) {
     // The loader passes EXCEPTION_POINTERS (see signal_context.cpp).
     const CONTEXT* c = static_cast<const EXCEPTION_POINTERS*>(ucontext)->ContextRecord;
     const std::uint64_t regs[] = {c->Rax, c->Rbx, c->Rcx, c->Rdx, c->Rsi, c->Rdi, c->R14, c->R15};
+#elif defined(__APPLE__)
+    const auto* uc = static_cast<const ucontext_t*>(ucontext);
+    const auto* ss = &uc->uc_mcontext->__ss;
+    const std::uint64_t regs[] = {ss->__rax, ss->__rbx, ss->__rcx, ss->__rdx,
+                                  ss->__rsi, ss->__rdi, ss->__r14, ss->__r15};
 #else
     const auto* uc = static_cast<const ucontext_t*>(ucontext);
     const auto* g = uc->uc_mcontext.gregs;

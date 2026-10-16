@@ -63,6 +63,8 @@ static ABI int32_t kernel_sleep(uint32_t seconds) {
 static ABI int32_t get_thread_id(void) {
 #ifdef _WIN32
     return (int32_t)GetCurrentThreadId();
+#elif defined(__APPLE__)
+    return (int32_t)compat_gettid();
 #else
     return (int32_t)syscall(SYS_gettid);
 #endif

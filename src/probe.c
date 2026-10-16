@@ -1,5 +1,9 @@
 /* Minimal x86-64 native loader experiment. Not a PS4 emulator or game port. */
 #define _GNU_SOURCE
+#ifdef __APPLE__
+#define _XOPEN_SOURCE 700 /* ucontext.h needs it; the fault handler reads uc_mcontext */
+#define _DARWIN_C_SOURCE  /* ...while keeping the BSD extensions (dladdr, MAP_ANON, ...) */
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,7 +22,9 @@
 #include <mmsystem.h>
 #else
 #include <sys/mman.h>
+#ifndef __APPLE__
 #include <malloc.h>
+#endif
 #include <unistd.h>
 #include <signal.h>
 #include <ucontext.h>
@@ -27,6 +33,35 @@
 #include <execinfo.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <mach/thread_act.h>
+/* mach/vm_param.h defines round_page as a macro; this file has its own function. */
+#undef round_page
+#endif
+#endif
+
+/* User-context register access and a fault-safe guest memory read (Linux: process_vm_readv;
+ * macOS: mach_vm_read_overwrite, since reading a bad frame must not fault). */
+#ifdef __APPLE__
+#define UC_RIP(uc) ((uintptr_t)(uc)->uc_mcontext->__ss.__rip)
+#define UC_RBP(uc) ((uintptr_t)(uc)->uc_mcontext->__ss.__rbp)
+#define UC_RDI(uc) ((uintptr_t)(uc)->uc_mcontext->__ss.__rdi)
+static ssize_t compat_process_vm_read(void *local, size_t size, void *remote) {
+    mach_vm_size_t got = 0;
+    kern_return_t kr = mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(uintptr_t)remote,
+                                              size, (mach_vm_address_t)(uintptr_t)local, &got);
+    return kr == KERN_SUCCESS ? (ssize_t)got : -1;
+}
+#else
+#define UC_RIP(uc) ((uintptr_t)(uc)->uc_mcontext.gregs[REG_RIP])
+#define UC_RBP(uc) ((uintptr_t)(uc)->uc_mcontext.gregs[REG_RBP])
+#define UC_RDI(uc) ((uintptr_t)(uc)->uc_mcontext.gregs[REG_RDI])
+static ssize_t compat_process_vm_read(void *local, size_t size, void *remote) {
+    struct iovec l = {local, size}, r = {remote, size};
+    return process_vm_readv(getpid(), &l, 1, &r, 1, 0);
+}
 #endif
 
 typedef struct { uint64_t address, size, flags; } Segment;
@@ -117,7 +152,7 @@ static ABI __attribute__((noreturn)) void unresolved(uint32_t id, uintptr_t argu
     uintptr_t caller=(uintptr_t)__builtin_return_address(0)-(uintptr_t)image;
     for (uint64_t m=0;m<module_count;++m)
         if (caller>=modules[m].base && caller-modules[m].base<modules[m].size)
-            printf("Caller in linked module %" PRIu64 " (%s): +0x%" PRIxPTR "\n",m,m==0 ? "libc.prx" : "system module",caller-modules[m].base);
+            printf("Caller in linked module %" PRIu64 " (%s): +0x%" PRIxPTR "\n",m,m==0 ? "libc.prx" : "system module",(uintptr_t)(caller-modules[m].base));
     runtime_report();
     puts(entered_game ? "Original guest entry instructions executed; game initialization is incomplete." :
                         "Native libc initialization is incomplete; game entry has not run.");
@@ -127,10 +162,17 @@ static ABI __attribute__((noreturn)) void unresolved(uint32_t id, uintptr_t argu
 #ifndef _WIN32
 /* enter_on_stack(entry, arg0, arg1, stack_top): call entry(arg0,arg1) on a new stack. */
 void enter_on_stack(void *entry, void *arg0, void *arg1, void *top);
+#ifdef __APPLE__ /* Mach-O global symbols carry a leading underscore */
+__asm__(".text\n.globl _enter_on_stack\n_enter_on_stack:\n"
+        " push %rbp\n mov %rsp,%rbp\n and $-16,%rcx\n mov %rcx,%rsp\n"
+        " mov %rdi,%rax\n mov %rsi,%rdi\n mov %rdx,%rsi\n call *%rax\n"
+        " mov %rbp,%rsp\n pop %rbp\n ret\n");
+#else
 __asm__(".text\n.globl enter_on_stack\nenter_on_stack:\n"
         " push %rbp\n mov %rsp,%rbp\n and $-16,%rcx\n mov %rcx,%rsp\n"
         " mov %rdi,%rax\n mov %rsi,%rdi\n mov %rdx,%rsi\n call *%rax\n"
         " mov %rbp,%rsp\n pop %rbp\n ret\n");
+#endif
 #endif
 static ABI void guest_exit(void) { puts("Runtime: process finalizer callback reached"); }
 /* sotc: with the user's own libSceNgs2/libSceUlt linked (link_modules.py --sys-modules) their
@@ -670,7 +712,7 @@ static void fault(int sig, siginfo_t *info, void *context) {
     }
     /* The process is terminating: dladdr/snprintf are acceptable here. */
     ucontext_t *uc = context;
-    uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+    uintptr_t rip = UC_RIP(uc);
     char line[512];
     Dl_info where;
     if (rip - (uintptr_t)image < 0x10000000)
@@ -705,23 +747,25 @@ static void write_hex(char *out, uint64_t v) {
     const char digits[] = "0123456789abcdef";
     for (int i = 0; i < 16; ++i) out[i] = digits[(v >> (60 - i * 4)) & 15];
 }
-static void dump_frames(ucontext_t *uc) {
+static void dump_frames_raw(uintptr_t rip, uintptr_t rbp, uint64_t tid) {
     char line[] = "  tid=0000000000000000 rip=0000000000000000 image-relative=0000000000000000 host-relative=0000000000000000\n";
-    uintptr_t rip=(uintptr_t)uc->uc_mcontext.gregs[REG_RIP], rbp=(uintptr_t)uc->uc_mcontext.gregs[REG_RBP];
-    uint64_t tid=(uint64_t)gettid();
-    /* First argument register: the lock address when a thread waits on a futex. */
-    char arg[]="  tid=0000000000000000 rdi=0000000000000000\n";
-    write_hex(arg+6,tid); write_hex(arg+27,(uint64_t)uc->uc_mcontext.gregs[REG_RDI]);
-    { ssize_t written_=write(2,arg,sizeof(arg)-1); (void)written_; }
     for (int depth=0; depth<24; ++depth) {
         write_hex(line+6,tid); write_hex(line+27,rip); write_hex(line+59,rip-(uintptr_t)image); write_hex(line+90,rip-exe_base);
         { ssize_t written_=write(2,line,sizeof(line)-1); (void)written_; }
         uintptr_t frame[2];
-        struct iovec local={frame,sizeof(frame)}, remote={(void *)rbp,sizeof(frame)};
-        if (!rbp || process_vm_readv(getpid(),&local,1,&remote,1,0)!=(ssize_t)sizeof(frame)) break;
+        if (!rbp || compat_process_vm_read(frame,sizeof(frame),(void *)rbp)!=(ssize_t)sizeof(frame)) break;
         if (frame[0]<=rbp) break;
         rbp=frame[0]; rip=frame[1];
     }
+}
+static void dump_frames(ucontext_t *uc) {
+    uintptr_t rip=UC_RIP(uc), rbp=UC_RBP(uc);
+    uint64_t tid=(uint64_t)gettid();
+    /* First argument register: the lock address when a thread waits on a futex. */
+    char arg[]="  tid=0000000000000000 rdi=0000000000000000\n";
+    write_hex(arg+6,tid); write_hex(arg+27,(uint64_t)UC_RDI(uc));
+    { ssize_t written_=write(2,arg,sizeof(arg)-1); (void)written_; }
+    dump_frames_raw(rip,rbp,tid);
 }
 static void thread_dump(int sig, siginfo_t *info, void *context) { (void)sig; (void)info; dump_frames(context); }
 static void watchdog(int sig, siginfo_t *info, void *context) {
@@ -729,6 +773,19 @@ static void watchdog(int sig, siginfo_t *info, void *context) {
     const char head[]="STOP: watchdog timeout; thread stacks:\n";
     { ssize_t written_=write(2,head,sizeof(head)-1); (void)written_; }
     dump_frames(context);
+#ifdef __APPLE__
+    /* No /proc, no tgkill: suspend-free walk of every Mach thread and read its registers. */
+    thread_act_array_t list; mach_msg_type_number_t count;
+    if (task_threads(mach_task_self(),&list,&count)==KERN_SUCCESS) {
+        for (mach_msg_type_number_t i=0;i<count;++i) {
+            x86_thread_state64_t st; mach_msg_type_number_t sc=x86_THREAD_STATE64_COUNT;
+            if (thread_get_state(list[i],x86_THREAD_STATE64,(thread_state_t)&st,&sc)==KERN_SUCCESS)
+                dump_frames_raw((uintptr_t)st.__rip,(uintptr_t)st.__rbp,0);
+            mach_port_deallocate(mach_task_self(),list[i]);
+        }
+        vm_deallocate(mach_task_self(),(vm_address_t)list,(vm_size_t)count*sizeof(thread_t));
+    }
+#else
     int dir=open("/proc/self/task",O_RDONLY|O_DIRECTORY);
     char buffer[4096];
     long n;
@@ -740,6 +797,7 @@ static void watchdog(int sig, siginfo_t *info, void *context) {
             if (tid>0 && tid!=self) { syscall(SYS_tgkill,getpid(),tid,SIGUSR2); usleep(20000); }
             at+=d->reclen;
         }
+#endif
     usleep(100000);
     _exit(128 + sig);
 }
@@ -833,7 +891,7 @@ void runtime_restart(void) {
     TerminateProcess(GetCurrentProcess(),0);
 #else
     puts("Runtime: restarting through run.sh");
-    syscall(SYS_close_range, 3u, ~0u, 0u);
+    close_range(3u, ~0u, 0u);
     execlp("bash", "bash", "run.sh", (char *)NULL);
     perror("runtime_restart: exec");
     _exit(1);
@@ -845,7 +903,7 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
     reserve_eboot_range();
 #endif
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
     /* Keep host heap objects handed to the guest (thread handles, TLS) in the
        non-PIE brk heap, i.e. below 1 TiB: the guest packs pointers into 40 bits. */
     mallopt(M_ARENA_MAX,1);
@@ -1109,7 +1167,9 @@ int main(int argc, char **argv) {
 #endif
     if (sotc_cpu) apply_sotc_cpu_patches(sotc_cpu, segments, ns, size);
     if (sotc_cmdline) apply_sotc_cmdline(sotc_cmdline, size);
+#ifdef _WIN32
     if (sotc_cpu) install_heap_hook();
+#endif
     protect(traps, round_page((import_count + 1) * 32), 5);
     protect(image, round_page(size), 0);
     int executable_entry = 0;

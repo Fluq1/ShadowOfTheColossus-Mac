@@ -27,6 +27,15 @@ asm(".section .rdata,\"dr\"\n"
     ".global bb_font_ttf_end\n"
     "bb_font_ttf_end:\n"
     ".text\n");
+#elif defined(__APPLE__)
+// Mach-O: C symbols carry a leading underscore; .p2align takes a power of two.
+asm(".section __TEXT,__const\n"
+    ".p2align 4\n"
+    ".globl _bb_font_ttf\n"
+    "_bb_font_ttf:\n"
+    ".incbin \"" BB_FONT_PATH "\"\n"
+    ".globl _bb_font_ttf_end\n"
+    "_bb_font_ttf_end:\n");
 #else
 asm(".section .rodata\n"
     ".balign 16\n"

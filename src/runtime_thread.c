@@ -20,7 +20,12 @@
 #else
 #include <sys/syscall.h>
 #include <sys/mman.h>
+#ifdef __APPLE__
+#include <architecture/i386/table.h>
+#include <i386/user_ldt.h>
+#else
 #include <asm/prctl.h>
+#endif
 #endif
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
 #define ATTR_MAGIC UINT32_C(0x41545452)
@@ -85,10 +90,58 @@ static void set_gs(void *base) {
 }
 #define tls_block_alloc(size) _aligned_malloc(size,64)
 #else
+#ifdef __APPLE__
+/* FSGSBASE (wrfsbase) is unavailable under Rosetta and macOS keeps its thread pointer in
+ * GS, so the guest TCB is reached through FS instead. The LDT descriptor base is only 32
+ * bits, so guest TLS must live in the low 4 GiB: the linker reserves [0x4000,4 GiB) as the
+ * TCB_SPACE segment (src/runtime_macos_tcb.c) and this bump allocator hands out 4 KiB slots,
+ * one LDT index each, from there. */
+#define BB_TCB_BASE ((uintptr_t)0x4000)
+#define BB_TCB_SLOT ((uintptr_t)0x1000)
+#define BB_TCB_FIRST_INDEX 8u
+#define BB_TCB_PAGES 1020u
+static unsigned char tcb_pages[BB_TCB_PAGES];
+static pthread_mutex_t tcb_alloc_lock=PTHREAD_MUTEX_INITIALIZER;
+static void *tcb_alloc(size_t size) {
+    size_t pages=(size+BB_TCB_SLOT-1)/BB_TCB_SLOT;
+    if (pages<1) pages=1;
+    void *block=NULL;
+    pthread_mutex_lock(&tcb_alloc_lock);
+    for (size_t i=0;i+pages<=BB_TCB_PAGES;) {
+        size_t j=i;
+        while (j<i+pages && !tcb_pages[j]) ++j;
+        if (j==i+pages) { for (size_t k=i;k<j;++k) tcb_pages[k]=1; block=(void *)(BB_TCB_BASE+i*BB_TCB_SLOT); break; }
+        i=j+1;
+    }
+    pthread_mutex_unlock(&tcb_alloc_lock);
+    if (!block) { fputs("STOP: guest TLS space exhausted\n",stderr); exit(21); }
+    return block;
+}
+/* Points FS at the guest TCB through a 32-bit-base data descriptor in the LDT. */
+static void set_gs(void *base) {
+    uintptr_t addr=(uintptr_t)base;
+    uint32_t index=(uint32_t)((addr-BB_TCB_BASE)/BB_TCB_SLOT)+BB_TCB_FIRST_INDEX;
+    /* Rosetta 2 only accepts an LDT data descriptor whose limit is exactly one 4 KiB
+     * page (0xFFF with byte granularity); any other limit aborts with "LDT not supported".
+     * The base may be unaligned, and 64-bit code does not enforce the limit for FS, so
+     * the guest TCB (at block+offset) can be encoded directly. */
+    union ldt_entry e;
+    memset(&e,0,sizeof e);
+    e.data.limit00=0xFFF; e.data.limit16=0;
+    e.data.base00=(unsigned short)addr; e.data.base16=(unsigned char)(addr>>16); e.data.base24=(unsigned char)(addr>>24);
+    e.data.type=DESC_DATA_WRITE; e.data.dpl=3; e.data.present=1;
+    e.data.stksz=DESC_DATA_32B; e.data.granular=DESC_GRAN_BYTE;
+    if (i386_set_ldt(index,&e,1)<0) { perror("STOP: i386_set_ldt"); exit(21); }
+    unsigned short selector=(unsigned short)(index*8|7);
+    __asm__ __volatile__("mov %0, %%fs"::"r"(selector));
+}
+#define tls_block_alloc(size) tcb_alloc(size)
+#else
 static void set_gs(void *base) {
     if (syscall(SYS_arch_prctl,ARCH_SET_GS,(unsigned long)base)) { perror("STOP: arch_prctl(ARCH_SET_GS)"); exit(21); }
 }
 #define tls_block_alloc(size) aligned_alloc(64,size)
+#endif
 #endif
 /* Build TCB/static TLS for the calling host thread and point GS at it. */
 static void attach(GuestThread *t) {
@@ -250,7 +303,11 @@ static ABI int32_t attr_set_guard(ThreadAttr **slot,uint64_t size) {
 static void set_host_name(const char *name) {
     char host[16]={0};
     memcpy(host,name,strnlen(name,sizeof(host)-1));
+#ifdef __APPLE__
+    pthread_setname_np(host); /* macOS sets the calling thread only */
+#else
     pthread_setname_np(pthread_self(),host);
+#endif
 }
 #ifdef _WIN32
 #define exit_setjmp(t) bb_setjmp((t)->exit_jump)
